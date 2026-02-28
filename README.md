@@ -14,24 +14,13 @@ ssh we@norns.local
 # password: sleep
 ```
 
-**2. Download the fixed source**
+**2. Run the following commands on norns**
 ```bash
-wget https://raw.githubusercontent.com/swinxx/ttymidi-sysex/main/ttymidi-fixed.c
-```
-
-**3. Compile**
-```bash
-gcc ttymidi-fixed.c -o ttymidi-fixed -lasound -pthread
-```
-
-**4. Replace the existing binary**
-```bash
-sudo cp ttymidi-fixed /usr/local/bin/ttymidi
-```
-
-**5. Restart ttymidi**
-```bash
-sudo systemctl restart ttymidi
+sudo systemctl stop ttymidi0.service
+cd ~/shieldXL/ttymidi
+wget -O ttymidi.c https://raw.githubusercontent.com/swinxx/ttymidi-sysex/main/ttymidi-fixed.c
+gcc ttymidi.c -o ttymidi -lasound -pthread
+sudo systemctl start ttymidi0.service
 ```
 
 ---
