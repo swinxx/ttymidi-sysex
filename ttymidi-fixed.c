@@ -59,7 +59,7 @@
 /* change this definition for the correct port */
 //#define _POSIX_SOURCE 1 /* POSIX compliant source */
 
-int run;
+volatile sig_atomic_t run;  // FIX (v1.01): must be volatile sig_atomic_t so the compiler does not cache it in a register and signal/thread reads always see the current value
 int serial;
 int port_out_id;
 
@@ -113,12 +113,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
   case 's':
     if (arg == NULL)
       break;
-    strncpy(arguments->serialdevice, arg, MAX_DEV_STR_LEN);
+    strncpy(arguments->serialdevice, arg, MAX_DEV_STR_LEN - 1);
+    arguments->serialdevice[MAX_DEV_STR_LEN - 1] = '\0';  // FIX (v1.01): strncpy does not null-terminate when src >= MAX_DEV_STR_LEN
     break;
   case 'n':
     if (arg == NULL)
       break;
-    strncpy(arguments->name, arg, MAX_DEV_STR_LEN);
+    strncpy(arguments->name, arg, MAX_DEV_STR_LEN - 1);
+    arguments->name[MAX_DEV_STR_LEN - 1] = '\0';  // FIX (v1.01): same null-termination fix
     break;
   case 'b':
     if (arg == NULL)
@@ -173,8 +175,10 @@ void arg_set_defaults(arguments_t *arguments) {
   arguments->verbose = 0;
   arguments->baudrate = B38400;
   char *name_tmp = (char *)"ttymidi";
-  strncpy(arguments->serialdevice, serialdevice_temp, MAX_DEV_STR_LEN);
-  strncpy(arguments->name, name_tmp, MAX_DEV_STR_LEN);
+  strncpy(arguments->serialdevice, serialdevice_temp, MAX_DEV_STR_LEN - 1);
+  arguments->serialdevice[MAX_DEV_STR_LEN - 1] = '\0';  // FIX (v1.01): ensure null-termination
+  strncpy(arguments->name, name_tmp, MAX_DEV_STR_LEN - 1);
+  arguments->name[MAX_DEV_STR_LEN - 1] = '\0';  // FIX (v1.01): ensure null-termination
 }
 
 const char *argp_program_version = "ttymidi 0.60";
@@ -629,6 +633,12 @@ int get_bytes_expected(int midicommand) {
     switch (midicommand) {
     case 0xF0:
       return BUF_SIZE - 1; // Sysex
+    case 0xf1:
+      return 1; // FIX (v1.01): MTC Quarter Frame — 1 data byte; was returning 0, causing the data byte to be misread as a new status byte
+    case 0xf2:
+      return 2; // spp
+    case 0xf3:
+      return 1; // FIX (v1.01): Song Select — 1 data byte; same issue as 0xF1
     case 0xf8:
       return 0; // clock
     case 0xfa:
@@ -637,8 +647,6 @@ int get_bytes_expected(int midicommand) {
       return 0; // continue
     case 0xfc:
       return 0; // stop
-    case 0xf2:
-      return 2; // spp
     default:
       return 0; // Other controller
     }
@@ -655,9 +663,13 @@ void *read_midi_from_serial_port(void *seq) {
   /* Lets first fast forward to first status byte... */
 
   if (!arguments.printonly) {
-    do
-      read(serial, buf, 1);
-    while (buf[0] >> 7 == 0);
+    // FIX (v1.01): Check read() return value. Ignoring it could leave buf[0]
+    // uninitialised on error/EOF, causing an infinite loop or garbage routing.
+    int rd;
+    do {
+      rd = read(serial, buf, 1);
+      if (rd <= 0) { run = FALSE; break; }
+    } while (buf[0] >> 7 == 0);
   }
 
   while (run) {
@@ -676,7 +688,10 @@ void *read_midi_from_serial_port(void *seq) {
 
     // Read a full midi message
     while (bytesleft > 0) {
-      read(serial, &readbyte, 1);
+      // FIX (v1.01): Check read() return value — on serial disconnect read()
+      // returns 0 (EOF) or -1 (error), leaving readbyte uninitialised and
+      // causing garbage MIDI events to be forwarded to ALSA.
+      if (read(serial, &readbyte, 1) <= 0) { run = FALSE; break; }
 
       // FIX: Real-time messages (0xF8–0xFF) can appear anywhere in the MIDI
       // stream, including inside a SysEx message. Per the MIDI spec they are
@@ -853,6 +868,12 @@ int main(int argc, char **argv) {
 
   void *status;
   pthread_join(midi_out_thread, &status);
+  // FIX (v1.01): Also join midi_in_thread. Previously only midi_out_thread was
+  // joined, so midi_in_thread could still be blocking in read() on the serial
+  // fd when main() closed it — undefined behaviour. The read() in
+  // midi_in_thread now checks for run==FALSE and exits the loop, so joining
+  // here is safe and ensures all resources are released before main() returns.
+  pthread_join(midi_in_thread, &status);
 
   /* restore the old port settings */
   tcsetattr(serial, TCSANOW, &oldtio);
