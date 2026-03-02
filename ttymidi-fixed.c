@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -63,7 +64,6 @@ volatile sig_atomic_t run;  // FIX (v1.01): must be volatile sig_atomic_t so the
 int serial;
 int port_out_id;
 
-int current_time, last_time;
 
 /* --------------------------------------------------------------------- */
 // Program options
@@ -88,12 +88,15 @@ typedef struct _arguments {
 } arguments_t;
 
 void exit_cli(int sig) {
+  (void)sig;  // FIX (v1.03): suppress unused parameter warning
   run = FALSE;
   // FIX (v1.02): Close serial fd so that the blocking read() in
   // midi_in_thread returns immediately with an error instead of
   // hanging indefinitely until the next MIDI byte arrives.
   if (serial >= 0) { close(serial); serial = -1; }
-  printf("\rttymidi closing down ... ");
+  // FIX (v1.03): printf() is not async-signal-safe and can deadlock
+  // if the signal arrives during another stdio call. Use write() instead.
+  write(STDOUT_FILENO, "\rttymidi closing down ... ", 25);
 }
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
@@ -160,6 +163,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         printf("Baud rate %i is not supported.\n", baud_temp);
         exit(1);
       }
+    break;  // FIX (v1.03): was falling through to ARGP_KEY_ARG
 
   case ARGP_KEY_ARG:
   case ARGP_KEY_END:
@@ -191,20 +195,6 @@ static char doc[] =
     "ttymidi - Connect serial port devices to ALSA MIDI programs!";
 static struct argp argp = {options, parse_opt, 0, doc};
 arguments_t arguments;
-
-// timer
-long getMicroTime() {
-  struct timeval currentTime;
-  gettimeofday(&currentTime, NULL);
-  return currentTime.tv_sec * (int)1e6 + currentTime.tv_usec;
-}
-
-void elapsedTime() {
-  current_time = getMicroTime();
-  printf("%d\n", current_time - last_time);
-  last_time = current_time;
-  fflush(stdout);
-}
 
 /* --------------------------------------------------------------------- */
 // MIDI stuff
@@ -340,13 +330,10 @@ void write_midi_action_to_serial_port(snd_seq_t *seq_handle) {
 
     case SND_SEQ_EVENT_SONGPOS:
       bytes[0] = 0xF2;
-      // 				bytes[1] = ev->data.control.param;
-      // 				bytes[2] = ev->data.control.value;
-      // 				ev->data.control.value += 8192; //16383
       bytes[1] = (int)ev->data.control.value & 0x7F;
       bytes[2] = (int)ev->data.control.value >> 7;
       if (!arguments.silent && arguments.verbose)
-        printf("Alsa    0x%02X Song Position Pointer  %03u %03u %03u\n",
+        printf("Alsa    0x%02X Song Position Pointer  %03u %03u\n",  // FIX (v1.03): was 4 format specifiers but only 3 args — undefined behaviour / potential crash
                bytes[0], bytes[1], bytes[2]);
       break;
 
@@ -387,28 +374,26 @@ void write_midi_action_to_serial_port(snd_seq_t *seq_handle) {
     case SND_SEQ_EVENT_CONTROLLER:
     case SND_SEQ_EVENT_PITCHBEND:
       bytes[2] = (bytes[2] & 0x7F);
-      if (write(serial, bytes, 3) < 0) { run = FALSE; break; }  // FIX (v1.02): graceful shutdown on serial disconnect
+      if (write(serial, bytes, 3) != 3) { run = FALSE; break; }  // FIX (v1.03): check for partial writes too, not just errors
       break;
 
     case SND_SEQ_EVENT_PGMCHANGE:
     case SND_SEQ_EVENT_CHANPRESS:
-      if (write(serial, bytes, 2) < 0) { run = FALSE; break; }  // FIX (v1.02)
+      if (write(serial, bytes, 2) != 2) { run = FALSE; break; }  // FIX (v1.03)
       break;
 
     case SND_SEQ_EVENT_CLOCK:
     case SND_SEQ_EVENT_START:
     case SND_SEQ_EVENT_STOP:
     case SND_SEQ_EVENT_CONTINUE:
-      if (write(serial, bytes, 1) < 0) { run = FALSE; break; }  // FIX (v1.02)
+      if (write(serial, bytes, 1) != 1) { run = FALSE; break; }  // FIX (v1.03)
       break;
     case SND_SEQ_EVENT_SONGPOS:
-      // 				bytes[2] = (bytes[2] & 0x7F);
-      if (write(serial, bytes, 3) < 0) { run = FALSE; break; }  // FIX (v1.02)
+      if (write(serial, bytes, 3) != 3) { run = FALSE; break; }  // FIX (v1.03)
       break;
     case SND_SEQ_EVENT_SYSEX:
-      // sysex addition - wrote this in the case statement
       if (sysex_len > 0) {
-        if (write(serial, sysex_data, sysex_len) < 0) { run = FALSE; break; }  // FIX (v1.02)
+        if (write(serial, sysex_data, sysex_len) != sysex_len) { run = FALSE; break; }  // FIX (v1.03)
       }
     }
 
@@ -437,7 +422,6 @@ void *read_midi_from_alsa(void *seq) {
   printf("\nStopping [PC]->[Hardware] communication...");
 }
 
-// void parse_midi_command(snd_seq_t* seq, int port_out_id, char *buf)
 void write_midi_to_alsa(snd_seq_t *seq, int port_out_id, char *buf,
                         int buflen) {
   /*
@@ -654,14 +638,12 @@ int get_bytes_expected(int midicommand) {
     default:
       return 0; // Other controller
     }
-    // 		if (midicommand == 0xF0) return BUF_SIZE - 1; // Sysex
-    //		else return 0; // Other controller
   }
   return 0;
 }
 
 void *read_midi_from_serial_port(void *seq) {
-  unsigned char buf[BUF_SIZE], readbyte, msg[MAX_MSG_SIZE];
+  unsigned char buf[BUF_SIZE], readbyte;
   int buflen = 0, bytesleft = BUF_SIZE - 1;
 
   /* Lets first fast forward to first status byte... */
@@ -684,7 +666,7 @@ void *read_midi_from_serial_port(void *seq) {
      */
 
     if (arguments.printonly) {
-      read(serial, buf, 1);
+      if (read(serial, buf, 1) <= 0) { run = FALSE; break; }  // FIX (v1.03): check read() return value
       printf("%02X\t", (int)buf[0] & 0xFF);
       fflush(stdout);
       continue;
@@ -763,17 +745,11 @@ void *read_midi_from_serial_port(void *seq) {
 // Main program
 
 int main(int argc, char **argv) {
-  // arguments arguments;
   struct termios oldtio, newtio;
-  struct serial_struct ser_info;
-  char *modem_device = "/dev/ttyS0";
   snd_seq_t *seq;
 
   arg_set_defaults(&arguments);
   argp_parse(&argp, argc, argv, 0, 0, &arguments);
-
-  // reset timer
-  current_time = getMicroTime();
 
   /*
    * Open MIDI output port
@@ -794,10 +770,14 @@ int main(int argc, char **argv) {
   }
 
   /* save current serial port settings */
-  tcgetattr(serial, &oldtio);
+  // FIX (v1.03): check return value
+  if (tcgetattr(serial, &oldtio) < 0) {
+    perror("tcgetattr");
+    exit(-1);
+  }
 
   /* clear struct for new port settings */
-  bzero(&newtio, sizeof(newtio));
+  memset(&newtio, 0, sizeof(newtio));  // FIX (v1.03): bzero() is deprecated
 
   /*
    * BAUDRATE : Set bps rate. You could also use cfsetispeed and cfsetospeed.
@@ -836,12 +816,11 @@ int main(int argc, char **argv) {
    * now clean the modem line and activate the settings for the port
    */
   tcflush(serial, TCIFLUSH);
-  tcsetattr(serial, TCSANOW, &newtio);
-
-  // Linux-specific: enable low latency mode (FTDI "nagling off")
-  //	ioctl(serial, TIOCGSERIAL, &ser_info);
-  //	ser_info.flags |= ASYNC_LOW_LATENCY;
-  //	ioctl(serial, TIOCSSERIAL, &ser_info);
+  // FIX (v1.03): check return value
+  if (tcsetattr(serial, TCSANOW, &newtio) < 0) {
+    perror("tcsetattr");
+    exit(-1);
+  }
 
   if (arguments.printonly) {
     printf("Super debug mode: Only printing the signal to screen. Nothing "
@@ -854,20 +833,25 @@ int main(int argc, char **argv) {
 
   /* Starting thread that is polling alsa midi in port */
   pthread_t midi_out_thread, midi_in_thread;
-  int iret1, iret2;
   run = TRUE;
-  iret1 =
-      pthread_create(&midi_out_thread, NULL, read_midi_from_alsa, (void *)seq);
+  // FIX (v1.03): check pthread_create() return values
+  if (pthread_create(&midi_out_thread, NULL, read_midi_from_alsa, (void *)seq) != 0) {
+    fprintf(stderr, "Error creating ALSA read thread.\n");
+    exit(-1);
+  }
   /* And also thread for polling serial data. As serial is currently read in
      blocking mode, by this we can enable ctrl+c quiting and avoid zombie
      alsa ports when killing app with ctrl+z */
-  iret2 = pthread_create(&midi_in_thread, NULL, read_midi_from_serial_port,
-                         (void *)seq);
+  if (pthread_create(&midi_in_thread, NULL, read_midi_from_serial_port,
+                     (void *)seq) != 0) {
+    fprintf(stderr, "Error creating serial read thread.\n");
+    exit(-1);
+  }
   signal(SIGINT, exit_cli);
   signal(SIGTERM, exit_cli);
 
   while (run) {
-    sleep(100);
+    usleep(100000);  // FIX (v1.03): was sleep(100) = 100 seconds; now 100 ms
   }
 
   void *status;
@@ -885,5 +869,6 @@ int main(int argc, char **argv) {
     tcsetattr(serial, TCSANOW, &oldtio);
     close(serial);
   }
+  snd_seq_close(seq);  // FIX (v1.03): properly close ALSA sequencer handle
   printf("\ndone!\n");
 }
