@@ -89,6 +89,10 @@ typedef struct _arguments {
 
 void exit_cli(int sig) {
   run = FALSE;
+  // FIX (v1.02): Close serial fd so that the blocking read() in
+  // midi_in_thread returns immediately with an error instead of
+  // hanging indefinitely until the next MIDI byte arrives.
+  if (serial >= 0) { close(serial); serial = -1; }
   printf("\rttymidi closing down ... ");
 }
 
@@ -383,28 +387,28 @@ void write_midi_action_to_serial_port(snd_seq_t *seq_handle) {
     case SND_SEQ_EVENT_CONTROLLER:
     case SND_SEQ_EVENT_PITCHBEND:
       bytes[2] = (bytes[2] & 0x7F);
-      write(serial, bytes, 3);
+      if (write(serial, bytes, 3) < 0) { run = FALSE; break; }  // FIX (v1.02): graceful shutdown on serial disconnect
       break;
 
     case SND_SEQ_EVENT_PGMCHANGE:
     case SND_SEQ_EVENT_CHANPRESS:
-      write(serial, bytes, 2);
+      if (write(serial, bytes, 2) < 0) { run = FALSE; break; }  // FIX (v1.02)
       break;
 
     case SND_SEQ_EVENT_CLOCK:
     case SND_SEQ_EVENT_START:
     case SND_SEQ_EVENT_STOP:
     case SND_SEQ_EVENT_CONTINUE:
-      write(serial, bytes, 1);
+      if (write(serial, bytes, 1) < 0) { run = FALSE; break; }  // FIX (v1.02)
       break;
     case SND_SEQ_EVENT_SONGPOS:
       // 				bytes[2] = (bytes[2] & 0x7F);
-      write(serial, bytes, 3);
+      if (write(serial, bytes, 3) < 0) { run = FALSE; break; }  // FIX (v1.02)
       break;
     case SND_SEQ_EVENT_SYSEX:
       // sysex addition - wrote this in the case statement
       if (sysex_len > 0) {
-        write(serial, sysex_data, sysex_len);
+        if (write(serial, sysex_data, sysex_len) < 0) { run = FALSE; break; }  // FIX (v1.02)
       }
     }
 
@@ -876,6 +880,10 @@ int main(int argc, char **argv) {
   pthread_join(midi_in_thread, &status);
 
   /* restore the old port settings */
-  tcsetattr(serial, TCSANOW, &oldtio);
+  // FIX (v1.02): serial may already be closed by exit_cli() signal handler
+  if (serial >= 0) {
+    tcsetattr(serial, TCSANOW, &oldtio);
+    close(serial);
+  }
   printf("\ndone!\n");
 }
