@@ -189,7 +189,7 @@ void arg_set_defaults(arguments_t *arguments) {
   arguments->name[MAX_DEV_STR_LEN - 1] = '\0';  // FIX (v1.01): ensure null-termination
 }
 
-const char *argp_program_version = "ttymidi 0.60";
+const char *argp_program_version = "ttymidi-sysex 1.03";
 const char *argp_program_bug_address = "tvst@hotmail.com";
 static char doc[] =
     "ttymidi - Connect serial port devices to ALSA MIDI programs!";
